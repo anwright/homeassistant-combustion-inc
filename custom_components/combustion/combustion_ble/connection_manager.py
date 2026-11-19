@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
+from .ble_manager import BleManager
 from .devices.device import Device
 from .logger import LOGGER
 from .utilities.asyncio_utils import ensure_future
@@ -19,6 +20,9 @@ class ConnectionManager:
         self.connection_timers: dict[str, asyncio.Task] = {}
         self.last_status_update: dict[str, datetime] = {}
         self.PROBE_STATUS_STALE_TIMEOUT = 10.0
+        self.STALE_CONNECTION_TIMEOUT_SECONDS = 30.0
+        self._probe_connected_at: dict[str, datetime] = {}
+        self.stale_disconnect_tasks: dict[str, asyncio.Task] = {}
         # Cooldown windows to avoid hammering the BLE stack on repeated failures.
         self._probe_connect_backoff_until: dict[str, datetime] = {}
         self._node_connect_backoff_until: dict[str, datetime] = {}
@@ -55,8 +59,9 @@ class ConnectionManager:
     def note_connect_succeeded(self, device: Device) -> None:
         if hasattr(device, "serial_number_string"):
             serial = getattr(device, "serial_number_string")
-            if isinstance(serial, str) and serial in self._probe_connect_backoff_until:
-                del self._probe_connect_backoff_until[serial]
+            if isinstance(serial, str):
+                self._probe_connected_at[serial] = datetime.now()
+                self._probe_connect_backoff_until.pop(serial, None)
                 return
 
         key = device.ble_identifier or device.unique_identifier
@@ -67,8 +72,25 @@ class ConnectionManager:
         if probe is None or not probe.is_connectable:
             return
 
+        serial = probe.serial_number_string
+        if probe.connection_state == Device.ConnectionState.CONNECTED and not self.dfu_mode_enabled:
+            last_activity = max(
+                self._probe_connected_at.get(serial, datetime.min),
+                self.last_status_update.get(serial, datetime.min),
+            )
+            if (
+                last_activity != datetime.min
+                and (datetime.now() - last_activity).total_seconds()
+                > self.STALE_CONNECTION_TIMEOUT_SECONDS
+                and serial not in self.stale_disconnect_tasks
+            ):
+                self.stale_disconnect_tasks[serial] = asyncio.create_task(
+                    self._disconnect_stalled_probe(probe)
+                )
+            return
+
         # Avoid repeated connect storms if the probe (or the host) is currently refusing connects.
-        if self._in_backoff(self._probe_connect_backoff_until, probe.serial_number_string):
+        if self._in_backoff(self._probe_connect_backoff_until, serial):
             return
 
         probe_status_stale = True
@@ -93,6 +115,23 @@ class ConnectionManager:
             self.connection_timers[probe.serial_number_string] = asyncio.create_task(
                 self.connect_probe_after_delay(probe)
             )
+
+    async def _disconnect_stalled_probe(self, probe: "Probe") -> None:
+        """Release a silent connection so the next advertisement can select a proxy."""
+        serial = probe.serial_number_string
+        identifier = probe.ble_identifier
+        try:
+            LOGGER.debug("Disconnecting probe %s after stale status notifications", serial)
+            await probe.disconnect()
+            if identifier and probe.connection_state == Device.ConnectionState.CONNECTED:
+                if BleManager.shared.get_connected_peripheral(identifier) is None:
+                    self.device_manager.did_disconnect_from(identifier)
+        except Exception:
+            LOGGER.exception("Failed to release stalled probe connection for %s", serial)
+        finally:
+            # Give a failed disconnect time to settle before trying again.
+            self._probe_connected_at[serial] = datetime.now()
+            self.stale_disconnect_tasks.pop(serial, None)
 
     def clear_handlers_for_probe(self, probe: "Probe", msg: str = "None"):
         """Clear all handlers for the given probe."""

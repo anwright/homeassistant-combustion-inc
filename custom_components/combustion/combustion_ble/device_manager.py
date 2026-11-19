@@ -123,8 +123,12 @@ class DeviceManager(BleManagerDelegate):
             await asyncio.gather(self.timer_task, return_exceptions=True)
             self.timer_task = None
 
-        connection_tasks = list(self.connection_manager.connection_timers.values())
+        connection_tasks = [
+            *self.connection_manager.connection_timers.values(),
+            *self.connection_manager.stale_disconnect_tasks.values(),
+        ]
         self.connection_manager.connection_timers.clear()
+        self.connection_manager.stale_disconnect_tasks.clear()
         for task in connection_tasks:
             task.cancel()
         if connection_tasks:

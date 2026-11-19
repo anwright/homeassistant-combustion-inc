@@ -1,5 +1,5 @@
 import enum
-from typing import Optional
+from typing import Callable, Optional
 
 from bleak import (
     AdvertisementDataCallback,
@@ -115,6 +115,7 @@ class BleManager:
     def __init__(self):
         self.clients: dict[str, BleakClient] = {}
         self.ble_devices: dict[str, BLEDevice] = {}
+        self.ble_device_resolver: Callable[[str], BLEDevice | None] | None = None
         self.scanner: Optional[BleakScanner] = None
         self.delegate: Optional[BleManagerDelegate] = None
         self.device_status_characteristics: dict[str, BleakGATTCharacteristic] = {}
@@ -164,6 +165,7 @@ class BleManager:
                 LOGGER.exception("Error disconnecting client")
         self.clients = {}
         self.ble_devices = {}
+        self.ble_device_resolver = None
         self._pending_connections = set()
         self._pending_gatt_reads = PendingGattReads()
         self.device_status_characteristics.clear()
@@ -234,7 +236,15 @@ class BleManager:
                 self.delegate.did_connect_to(identifier)
                 return
 
-        ble_device = self.ble_devices.get(identifier)
+        # Hosts such as Home Assistant can change the scanner/proxy selected
+        # for an address without another advertisement reaching this manager.
+        # Resolve the current route when connecting instead of reusing a stale
+        # BLEDevice from the last callback.
+        ble_device = (
+            self.ble_device_resolver(identifier)
+            if self.ble_device_resolver is not None
+            else self.ble_devices.get(identifier)
+        )
         if not ble_device:
             LOGGER.warning("No BLEDevice found for identifier [%s]", identifier)
             self.delegate.did_fail_to_connect_to(identifier)

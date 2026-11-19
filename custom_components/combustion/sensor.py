@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from homeassistant import config_entries, core
@@ -8,6 +9,7 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import slugify
 
 from .combustion_ble.ble_data.prediction_mode import PredictionMode
 from .combustion_ble.ble_data.prediction_state import PredictionState
@@ -175,25 +177,144 @@ def convert_temp(temp: float, unit: TempUnit) -> float:
     return temp
 
 
-def _migrate_node_unique_id(hass: core.HomeAssistant, device: MeatNetNode, type_data: list[Any], name: str) -> None:
-    """Keep legacy node registry entries when switching to address based IDs."""
+def _probe_unique_id(serial_number: str, type_data: list[Any]) -> str:
+    """Keep the existing internal identity when changing visible entity names."""
+    return f"Combustion {type_data[0]} {serial_number}"
+
+
+def _migrate_entity_registry(
+    hass: core.HomeAssistant,
+    unique_id: str,
+    legacy_unique_ids: list[str],
+    name: str,
+    identifiers: list[str],
+) -> None:
+    """Remove device identifiers from registered entity names and entity IDs."""
     registry = er.async_get(hass)
-    new_id = f"{DOMAIN}_{device.unique_identifier}_{type_data[3]}"
-    if registry.async_get_entity_id("sensor", DOMAIN, new_id):
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    updates = {}
+    if entity_id is None:
+        for old_unique_id in dict.fromkeys(legacy_unique_ids):
+            entity_id = registry.async_get_entity_id("sensor", DOMAIN, old_unique_id)
+            if entity_id is not None:
+                updates["new_unique_id"] = unique_id
+                break
+    if entity_id is None:
         return
 
-    legacy_names = [name]
+    entry = registry.async_get(entity_id)
+    if entry is not None and (current_name := entry.name or entry.original_name):
+        cleaned_name = current_name
+        for identifier in identifiers:
+            if identifier:
+                cleaned_name = re.sub(re.escape(identifier), "", cleaned_name, flags=re.IGNORECASE)
+        cleaned_name = " ".join(cleaned_name.split()) or name
+        if cleaned_name != current_name:
+            updates["name"] = cleaned_name if entry.name else name
+
+    object_id = entity_id.removeprefix("sensor.")
+    cleaned_id = object_id
+    for identifier in identifiers:
+        token = slugify(identifier) if identifier else ""
+        if token:
+            cleaned_id = re.sub(
+                rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", "", cleaned_id
+            )
+    if cleaned_id != object_id:
+        old_default_id = slugify(entry.original_name) if entry and entry.original_name else ""
+        if old_default_id and re.fullmatch(rf"{re.escape(old_default_id)}(?:_[0-9]+)?", object_id):
+            cleaned_id = slugify(name)
+        else:
+            cleaned_id = re.sub(r"_+", "_", cleaned_id).strip("_")
+        base = f"sensor.{cleaned_id or slugify(name)}"
+        candidate = base
+        suffix = 2
+        while candidate != entity_id and (
+            registry.async_get(candidate) is not None or hass.states.get(candidate) is not None
+        ):
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        if candidate != entity_id:
+            updates["new_entity_id"] = candidate
+
+    if updates:
+        registry.async_update_entity(entity_id, **updates)
+
+
+def _migrate_node_entity_registry(
+    hass: core.HomeAssistant, device: MeatNetNode, type_data: list[Any], name: str
+) -> None:
+    """Migrate legacy node and Gauge entities to serial-free entity IDs."""
+    legacy_names = []
+    identifiers = []
     if device.ble_identifier:
-        legacy_names.append(
-            f"Combustion {type_data[0]} MeatNet Node {device.ble_identifier[-5:]}"
-        )
+        address_suffix = device.ble_identifier[-5:]
+        identifiers.append(address_suffix)
+        legacy_names.append(f"Combustion {type_data[0]} MeatNet Node {address_suffix}")
     if device.gauge_serial:
+        identifiers.append(device.gauge_serial)
         legacy_names.append(f"Combustion {type_data[0]} Gauge {device.gauge_serial}")
-    for old_id in dict.fromkeys(legacy_names):
-        entity_id = registry.async_get_entity_id("sensor", DOMAIN, old_id)
-        if entity_id:
-            registry.async_update_entity(entity_id, new_unique_id=new_id)
-            return
+    _migrate_entity_registry(
+        hass,
+        f"{DOMAIN}_{device.unique_identifier}_{type_data[3]}",
+        legacy_names,
+        name,
+        identifiers,
+    )
+
+
+def _migrate_offline_entities(
+    hass: core.HomeAssistant, config_entry: config_entries.ConfigEntry
+) -> None:
+    """Rename stored entities before their devices advertise again."""
+    registry = er.async_get(hass)
+    for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id):
+        if entry.domain != "sensor" or entry.platform != DOMAIN:
+            continue
+        migrated = False
+        for type_data in SENSOR_TYPES.values():
+            prefix = f"Combustion {type_data[0]} "
+            if not entry.unique_id.startswith(prefix):
+                continue
+            serial_number = entry.unique_id[len(prefix):]
+            if re.fullmatch(r"[0-9A-Fa-f]{8}", serial_number):
+                _migrate_entity_registry(
+                    hass,
+                    _probe_unique_id(serial_number, type_data),
+                    [],
+                    f"Combustion {type_data[0]}",
+                    [serial_number],
+                )
+                migrated = True
+            break
+        if migrated:
+            continue
+
+        for sensor_type, type_data in NODE_SENSOR_TYPES.items():
+            name = (
+                f"Combustion MeatNet Node {type_data[0]}"
+                if sensor_type in ("node_rssi", "node_probes")
+                else f"Combustion {type_data[0]}"
+            )
+            for source in (entry.unique_id, entry.name, entry.original_name):
+                if source is None:
+                    continue
+                for kind in ("MeatNet Node", "Gauge"):
+                    prefix = f"Combustion {type_data[0]} {kind} "
+                    if source.startswith(prefix):
+                        _migrate_entity_registry(
+                            hass,
+                            entry.unique_id,
+                            [],
+                            name,
+                            [source[len(prefix):]],
+                        )
+                        migrated = True
+                        break
+                if migrated:
+                    break
+            if migrated:
+                break
 
 
 async def async_setup_entry(
@@ -203,6 +324,7 @@ async def async_setup_entry(
 ):
 
     config = hass.data[DOMAIN][config_entry.entry_id]
+    _migrate_offline_entities(hass, config_entry)
     created_ids: set[tuple[str, str]] = set()
 
     @callback
@@ -212,12 +334,20 @@ async def async_setup_entry(
 
             sensors = []
             for sensor_type in SENSOR_TYPES:
-                name = f"Combustion {SENSOR_TYPES[sensor_type][0]} {device.serial_number_string}"
+                type_data = SENSOR_TYPES[sensor_type]
+                name = f"Combustion {type_data[0]}"
                 key = (device.unique_identifier, sensor_type)
                 if key in created_ids:
                     continue
                 created_ids.add(key)
-                sensors.append(CombustionProbeEntity(hass, device, config, SENSOR_TYPES[sensor_type], name))
+                _migrate_entity_registry(
+                    hass,
+                    _probe_unique_id(device.serial_number_string, type_data),
+                    [],
+                    name,
+                    [device.serial_number_string],
+                )
+                sensors.append(CombustionProbeEntity(hass, device, config, type_data, name))
 
             if sensors:
                 async_add_entities(sensors)
@@ -229,12 +359,12 @@ async def async_setup_entry(
             # Base repeater/node sensors
             for sensor_type in ["node_rssi", "node_probes"]:
                 type_data = NODE_SENSOR_TYPES[sensor_type]
-                name = f"Combustion {type_data[0]} {format_device_name(device)}"
+                name = f"Combustion MeatNet Node {type_data[0]}"
                 key = (device.unique_identifier, sensor_type)
                 if key in created_ids:
                     continue
                 created_ids.add(key)
-                _migrate_node_unique_id(hass, device, type_data, name)
+                _migrate_node_entity_registry(hass, device, type_data, name)
                 sensors.append(CombustionNodeEntity(hass, device, config, type_data, name))
 
             # Gauge-only sensors (create only when Gauge MSD has been observed)
@@ -250,12 +380,12 @@ async def async_setup_entry(
                     "gauge_alarm_high_temp",
                 ]:
                     type_data = NODE_SENSOR_TYPES[sensor_type]
-                    name = f"Combustion {type_data[0]} {format_device_name(device)}"
+                    name = f"Combustion {type_data[0]}"
                     key = (device.unique_identifier, sensor_type)
                     if key in created_ids:
                         continue
                     created_ids.add(key)
-                    _migrate_node_unique_id(hass, device, type_data, name)
+                    _migrate_node_entity_registry(hass, device, type_data, name)
                     sensors.append(CombustionNodeEntity(hass, device, config, type_data, name))
 
             if sensors:
@@ -312,7 +442,7 @@ class CombustionProbeEntity(SensorEntity):
 
     @property
     def unique_id(self) -> str:
-        return self.sensor_name
+        return _probe_unique_id(self.device.serial_number_string, self.sensor_type_data)
 
     @property
     def available(self) -> bool:

@@ -265,9 +265,11 @@ class Probe(Device):
 
         self._hop_count = advertising.hop_count
 
-        # Only update rest of data if not connected to probe.
-        # Otherwise, rely on status notifications to update data
-        if self.connection_state != self.ConnectionState.CONNECTED:
+        # A BLE proxy can keep a GATT connection marked connected after its
+        # notifications stop. Resume using advertisements from other scanners
+        # until status notifications become fresh again.
+        self._update_status_notifications_stale()
+        if self.connection_state != self.ConnectionState.CONNECTED or self._status_notifications_stale:
             if advertising.mode_id.mode == ProbeMode.NORMAL:
                 # If we should update normal mode, do so, but since this is Advertising info
                 # and does not contain Prediction information, DO NOT lock it out. We want to

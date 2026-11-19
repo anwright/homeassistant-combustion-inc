@@ -1,10 +1,14 @@
 """Regression checks for the bundled BLE library."""
 
 import asyncio
+from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from custom_components.combustion.combustion_ble.ble_manager import BleManager
+from custom_components.combustion.combustion_ble.ble_data.advertising_data import CombustionProductType
+from custom_components.combustion.combustion_ble.ble_data.mode_id import ProbeMode
+from custom_components.combustion.combustion_ble.connection_manager import ConnectionManager
 from custom_components.combustion.combustion_ble.const import (
     DEVICE_STATUS_CHARACTERISTIC,
     UART_RX_CHARACTERISTIC,
@@ -27,6 +31,27 @@ async def test_passive_bluetooth_shutdown_disconnects_clients():
     client.disconnect.assert_awaited_once()
     assert manager.clients == {}
     assert manager.ble_devices == {}
+
+
+async def test_connection_uses_current_proxy_route():
+    manager = BleManager()
+    old_device = SimpleNamespace(address="AA", name="Probe")
+    new_device = SimpleNamespace(address="AA", name="Probe")
+    manager.ble_devices["AA"] = old_device
+    manager.ble_device_resolver = Mock(return_value=new_device)
+    manager.delegate = SimpleNamespace(did_connect_to=Mock(), did_fail_to_connect_to=Mock())
+    manager.handle_discovered_services = Mock()
+    client = SimpleNamespace(is_connected=True)
+
+    with patch(
+        "custom_components.combustion.combustion_ble.ble_manager.establish_connection",
+        new=AsyncMock(return_value=client),
+    ) as establish:
+        await manager.connect("AA")
+
+    assert establish.await_args.args[1:3] == (new_device, "Probe")
+    manager.ble_device_resolver.assert_called_once_with("AA")
+    manager.delegate.did_connect_to.assert_called_once_with("AA")
 
 
 async def test_service_order_does_not_drop_status_notifications():
@@ -72,3 +97,62 @@ def test_probe_virtual_temperatures_returns_temperature_data():
     probe._virtual_temperatures = Monitorable(values)
 
     assert probe.virtual_temperatures is values
+
+
+def test_connected_probe_uses_advertising_when_notifications_go_stale():
+    probe = Probe.__new__(Probe)
+    probe.connection_state = Probe.ConnectionState.CONNECTED
+    probe._last_status_notification_time = datetime.now()
+    probe._last_normal_mode = None
+    probe._last_normal_mode_hop_count = None
+    probe._rssi = Monitorable(-70)
+    probe._update_id_color_battery = Mock()
+    probe._update_temperatures = Mock()
+    advertising = SimpleNamespace(
+        type=CombustionProductType.PROBE,
+        hop_count=None,
+        mode_id=SimpleNamespace(mode=ProbeMode.NORMAL, id=1, color=1),
+        battery_status_virtual_sensors=SimpleNamespace(battery_status=1, virtual_sensors=object()),
+        temperatures=object(),
+    )
+
+    probe.update_with_advertising(advertising, True, -60, "AA")
+    probe._update_temperatures.assert_not_called()
+
+    probe._last_status_notification_time -= timedelta(seconds=Probe.STATUS_NOTIFICATION_STALE_TIMEOUT + 1)
+    probe.update_with_advertising(advertising, True, -55, "AA")
+    probe._update_temperatures.assert_called_once()
+
+
+async def test_stalled_probe_connection_is_released_for_proxy_failover():
+    device_manager = SimpleNamespace(did_disconnect_from=Mock())
+    connection_manager = ConnectionManager(device_manager)
+    probe = SimpleNamespace(
+        serial_number_string="DEADBEEF",
+        ble_identifier="AA",
+        is_connectable=True,
+        connection_state=Probe.ConnectionState.CONNECTED,
+        disconnect=AsyncMock(),
+    )
+    connection_manager.note_connect_succeeded(probe)
+    connection_manager.received_probe_advertising(probe)
+    assert not connection_manager.stale_disconnect_tasks
+
+    connection_manager._probe_connected_at[probe.serial_number_string] -= timedelta(
+        seconds=connection_manager.STALE_CONNECTION_TIMEOUT_SECONDS + 1
+    )
+    connection_manager.last_status_update[probe.serial_number_string] = datetime.now()
+    connection_manager.received_probe_advertising(probe)
+    assert not connection_manager.stale_disconnect_tasks
+
+    connection_manager.last_status_update[probe.serial_number_string] -= timedelta(
+        seconds=connection_manager.STALE_CONNECTION_TIMEOUT_SECONDS + 1
+    )
+    connection_manager.received_probe_advertising(probe)
+    task = connection_manager.stale_disconnect_tasks[probe.serial_number_string]
+    with patch.object(BleManager.shared, "get_connected_peripheral", return_value=None):
+        await task
+
+    probe.disconnect.assert_awaited_once()
+    device_manager.did_disconnect_from.assert_called_once_with("AA")
+    assert not connection_manager.stale_disconnect_tasks

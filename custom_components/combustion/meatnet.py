@@ -32,6 +32,11 @@ class MeatNetManager:
         try:
             manager.enable_meatnet()
             await manager.init_bluetooth(mode=BluetoothMode.PASSIVE)
+            BleManager.shared.ble_device_resolver = (
+                lambda address: bluetooth.async_ble_device_from_address(
+                    self.hass, address, connectable=True
+                )
+            )
             manager.add_device_listener(self._devices_changed)
             self._unsubscribe = bluetooth.async_register_callback(
                 self.hass,
