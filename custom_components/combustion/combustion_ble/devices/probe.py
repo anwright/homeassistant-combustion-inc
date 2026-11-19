@@ -26,17 +26,14 @@ if TYPE_CHECKING:
     from ..device_manager import DeviceManager
 
 
-DEADBAND_RANGE_IN_CELSIUS = 0.05
-
-
 class VirtualTemperatures:
     """Virtual temperature values for this Probe."""
 
     def __init__(
         self,
-        core_temperature=DEADBAND_RANGE_IN_CELSIUS,
-        surface_temperature=DEADBAND_RANGE_IN_CELSIUS,
-        ambient_temperature=DEADBAND_RANGE_IN_CELSIUS,
+        core_temperature: float | None = None,
+        surface_temperature: float | None = None,
+        ambient_temperature: float | None = None,
     ):
         self.core_temperature = core_temperature
         """The Core temperature, in Celsius"""
@@ -171,7 +168,7 @@ class Probe(Device):
     @property
     def virtual_temperatures(self) -> VirtualTemperatures:
         """The current virtual temperatures."""
-        return self._battery_status.value
+        return self._virtual_temperatures.value
 
     def add_virtual_temperatures_listener(
         self, listener: UpdateListener[VirtualTemperatures]

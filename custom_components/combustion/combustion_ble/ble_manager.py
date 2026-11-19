@@ -156,28 +156,45 @@ class BleManager:
                 await self.scanner.stop()
             except Exception:
                 LOGGER.exception("Error stopping Bleak scanner")
-            if self.clients:
-                client_list = [c for c in self.clients]
-                for client in client_list:
-                    try:
-                        if self.clients[client].is_connected:
-                            await self.clients[client].disconnect()
-                    except Exception:
-                        LOGGER.exception("Error disconnecting client")
+        for client in list(self.clients.values()):
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                LOGGER.exception("Error disconnecting client")
         self.clients = {}
+        self.ble_devices = {}
         self._pending_connections = set()
         self._pending_gatt_reads = PendingGattReads()
+        self.device_status_characteristics.clear()
+        self.uart_characteristics.clear()
+        self.fw_revision_characteristics.clear()
+        self.hw_revision_characteristics.clear()
+        self.serial_number_characteristics.clear()
+        self.model_number_characteristics.clear()
         self.scanner = None
         self.is_stopping = False
 
     def detection_callback(self, device: BLEDevice, advertisement_data: AdvertisementData):
-        if BT_MANUFACTURER_ID not in advertisement_data.manufacturer_data:
+        self.process_advertisement(
+            device, advertisement_data.manufacturer_data, advertisement_data.rssi, True
+        )
+
+    def process_advertisement(
+        self,
+        device: BLEDevice,
+        manufacturer_data: dict[int, bytes],
+        rssi: int,
+        is_connectable: bool,
+    ) -> None:
+        """Process an advertisement supplied by Bleak or a host Bluetooth stack."""
+        if BT_MANUFACTURER_ID not in manufacturer_data:
             return
 
         # Store the BLEDevice for use with establish_connection
         self.ble_devices[device.address] = device
 
-        msd_payload = advertisement_data.manufacturer_data[BT_MANUFACTURER_ID]
+        msd_payload = manufacturer_data[BT_MANUFACTURER_ID]
 
         # Peek product type byte (offset 2 in full MSD, but Bleak omits vendor id).
         # Full MSD format: [vendor_id(2)][product_type(1)]...
@@ -190,8 +207,8 @@ class BleManager:
             if gauge_adv and self.delegate:
                 self.delegate.update_device_with_gauge_advertising(
                     advertising=gauge_adv,
-                    is_connectable=True,  # TODO: support non-connectable devices
-                    rssi=advertisement_data.rssi,
+                    is_connectable=is_connectable,
+                    rssi=rssi,
                     identifier=device.address,
                 )
             return
@@ -200,8 +217,8 @@ class BleManager:
         if advertising_data and self.delegate:
             self.delegate.update_device_with_advertising(
                 advertising=advertising_data,
-                is_connectable=True,  # TODO: support non-connectable devices
-                rssi=advertisement_data.rssi,
+                is_connectable=is_connectable,
+                rssi=rssi,
                 identifier=device.address,
             )
 
@@ -400,6 +417,7 @@ class BleManager:
             else:
                 LOGGER.debug("uart_tx_notify_callback ignoring unknown char [%s]", char.uuid)
 
+        uart_tx_characteristic = None
         for service in client.services:
             for characteristic in service.characteristics:
                 if characteristic.uuid == UART_RX_CHARACTERISTIC:
@@ -437,23 +455,23 @@ class BleManager:
                             name="ble_manager[read_model_number]",
                         )
                 elif characteristic.uuid == UART_TX_CHARACTERISTIC:
-                    if characteristic.descriptors:
-                        client = self.get_connected_peripheral(identifier)
-                        if client:
-                            ensure_future(
-                                client.start_notify(characteristic, uart_tx_notify_callback),
-                                name="ble_manager[start_notify:uart_tx]",
-                            )
-                            status_char = self.device_status_characteristics.get(identifier)
-                            if status_char:
-                                ensure_future(
-                                    client.start_notify(status_char, uart_tx_notify_callback),
-                                    name="ble_manager[start_notify:device_status]",
-                                )
-                                ensure_future(
-                                    self.send_request(identifier, request=SessionInfoRequest()),
-                                    name="ble_manager[send_request:session_info]",
-                                )
+                    uart_tx_characteristic = characteristic
+
+        status_char = self.device_status_characteristics.get(identifier)
+
+        async def start_notifications():
+            # Service order is not fixed; subscribe before requesting a response.
+            try:
+                if uart_tx_characteristic and "notify" in uart_tx_characteristic.properties:
+                    await client.start_notify(uart_tx_characteristic, uart_tx_notify_callback)
+                if status_char and "notify" in status_char.properties:
+                    await client.start_notify(status_char, uart_tx_notify_callback)
+                if identifier in self.uart_characteristics:
+                    await self.send_request(identifier, request=SessionInfoRequest())
+            except BleakError:
+                LOGGER.exception("Failed to subscribe to notifications for [%s]", identifier)
+
+        ensure_future(start_notifications(), name="ble_manager[start_notifications]")
 
 
 # Instantiate the BleManager singleton

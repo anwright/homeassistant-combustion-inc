@@ -1,25 +1,24 @@
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import Optional
 import logging
-from datetime import datetime
+from typing import Any
 
-from .combustion_ble.devices.device import Device
-from .combustion_ble.devices.probe import Probe
-from .combustion_ble.devices.meat_net_node import MeatNetNode
 from homeassistant import config_entries, core
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import Entity
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
-from .const import DOMAIN, EVENT_DISCOVERED, TempUnit, EVENT_REFRESH
+from homeassistant.helpers import entity_registry as er
+
+from .combustion_ble.ble_data.prediction_mode import PredictionMode
+from .combustion_ble.ble_data.prediction_state import PredictionState
+from .combustion_ble.ble_data.prediction_type import PredictionType
+from .combustion_ble.devices.device import Device
+from .combustion_ble.devices.meat_net_node import MeatNetNode
+from .combustion_ble.devices.probe import Probe
+from .const import DOMAIN, EVENT_DISCOVERED, EVENT_REFRESH, TempUnit
 
 
 _LOGGER = logging.getLogger(__name__)
-
-# Best-effort de-dupe for entities created via repeated EVENT_DISCOVERED signals.
-_CREATED_UNIQUE_IDS: set[str] = set()
 
 # [ name, unit_of_measurement, device_class, state_id, options]
 SENSOR_TYPES = {
@@ -37,9 +36,9 @@ SENSOR_TYPES = {
     "prob_temp_surface": ["Surface Temperature", "temp", "temperature", "surface"],
     "rssi": ["RSSI", "dBm", "signal_strength", "rssi"],
     "battery": ["Battery", None, SensorDeviceClass.ENUM, "battery", ["OK", "LOW"]],
-    "prediction_mode": ["Prediction Mode", None, SensorDeviceClass.ENUM, "prediction_mode", ["NONE", "TIME_TO_REMOVAL", "REMOVAL_AND_RESTING"]],
-    "prediction_state": ["Prediction State", None, SensorDeviceClass.ENUM, "prediction_state", ["PROBE_NOT_INSERTED", "PROBE_INSERTED", "COOKING", "PREDICTING", "REMOVAL_PREDICTION_DONE"]],
-    "prediction_type": ["Prediction Type", None, SensorDeviceClass.ENUM, "prediction_type", ["NONE", "REMOVAL", "RESTING"]],
+    "prediction_mode": ["Prediction Mode", None, SensorDeviceClass.ENUM, "prediction_mode", [item.name for item in PredictionMode]],
+    "prediction_state": ["Prediction State", None, SensorDeviceClass.ENUM, "prediction_state", [item.name for item in PredictionState]],
+    "prediction_type": ["Prediction Type", None, SensorDeviceClass.ENUM, "prediction_type", [item.name for item in PredictionType]],
     "prediction_setpoint": ["Prediction Setpoint", "temp", "temperature", "prediction_setpoint"],
     "prediction_through": ["Prediction % Done", "%", "", "prediction_through"],
     "prediction_value": ["Prediction Remaining", "s", "duration", "prediction_value"],
@@ -176,6 +175,27 @@ def convert_temp(temp: float, unit: TempUnit) -> float:
     return temp
 
 
+def _migrate_node_unique_id(hass: core.HomeAssistant, device: MeatNetNode, type_data: list[Any], name: str) -> None:
+    """Keep legacy node registry entries when switching to address based IDs."""
+    registry = er.async_get(hass)
+    new_id = f"{DOMAIN}_{device.unique_identifier}_{type_data[3]}"
+    if registry.async_get_entity_id("sensor", DOMAIN, new_id):
+        return
+
+    legacy_names = [name]
+    if device.ble_identifier:
+        legacy_names.append(
+            f"Combustion {type_data[0]} MeatNet Node {device.ble_identifier[-5:]}"
+        )
+    if device.gauge_serial:
+        legacy_names.append(f"Combustion {type_data[0]} Gauge {device.gauge_serial}")
+    for old_id in dict.fromkeys(legacy_names):
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, old_id)
+        if entity_id:
+            registry.async_update_entity(entity_id, new_unique_id=new_id)
+            return
+
+
 async def async_setup_entry(
     hass: core.HomeAssistant,
     config_entry: config_entries.ConfigEntry,
@@ -183,21 +203,24 @@ async def async_setup_entry(
 ):
 
     config = hass.data[DOMAIN][config_entry.entry_id]
+    created_ids: set[tuple[str, str]] = set()
 
     @callback
     def event_create_entity(device: Device) -> None:
-        if (isinstance(device, Probe)):
+        if isinstance(device, Probe):
             _LOGGER.info(f"Discovered device: {device}")
 
             sensors = []
             for sensor_type in SENSOR_TYPES:
                 name = f"Combustion {SENSOR_TYPES[sensor_type][0]} {device.serial_number_string}"
-                if name in _CREATED_UNIQUE_IDS:
+                key = (device.unique_identifier, sensor_type)
+                if key in created_ids:
                     continue
-                _CREATED_UNIQUE_IDS.add(name)
+                created_ids.add(key)
                 sensors.append(CombustionProbeEntity(hass, device, config, SENSOR_TYPES[sensor_type], name))
 
-            async_add_entities(sensors, update_before_add=True)
+            if sensors:
+                async_add_entities(sensors)
 
         elif isinstance(device, MeatNetNode):
             _LOGGER.info(f"Discovered MeatNet device: {device}")
@@ -207,9 +230,11 @@ async def async_setup_entry(
             for sensor_type in ["node_rssi", "node_probes"]:
                 type_data = NODE_SENSOR_TYPES[sensor_type]
                 name = f"Combustion {type_data[0]} {format_device_name(device)}"
-                if name in _CREATED_UNIQUE_IDS:
+                key = (device.unique_identifier, sensor_type)
+                if key in created_ids:
                     continue
-                _CREATED_UNIQUE_IDS.add(name)
+                created_ids.add(key)
+                _migrate_node_unique_id(hass, device, type_data, name)
                 sensors.append(CombustionNodeEntity(hass, device, config, type_data, name))
 
             # Gauge-only sensors (create only when Gauge MSD has been observed)
@@ -226,12 +251,15 @@ async def async_setup_entry(
                 ]:
                     type_data = NODE_SENSOR_TYPES[sensor_type]
                     name = f"Combustion {type_data[0]} {format_device_name(device)}"
-                    if name in _CREATED_UNIQUE_IDS:
+                    key = (device.unique_identifier, sensor_type)
+                    if key in created_ids:
                         continue
-                    _CREATED_UNIQUE_IDS.add(name)
+                    created_ids.add(key)
+                    _migrate_node_unique_id(hass, device, type_data, name)
                     sensors.append(CombustionNodeEntity(hass, device, config, type_data, name))
 
-            async_add_entities(sensors, update_before_add=True)
+            if sensors:
+                async_add_entities(sensors)
 
     config_entry.async_on_unload(async_dispatcher_connect(hass, EVENT_DISCOVERED, event_create_entity))
 
@@ -239,19 +267,18 @@ async def async_setup_entry(
 class CombustionProbeEntity(SensorEntity):
 
     device: Probe
-    sensor_type_data: list[str]
-    config: any
+    sensor_type_data: list[Any]
+    config: dict
     sensor_name: str
-
+    _attr_should_poll = False
     unit_type: TempUnit = TempUnit.CELSIUS
 
-    def __init__(self, hass: core.HomeAssistant, device: Probe, config: any, sensor_type_data: list[str], name: str = None):
+    def __init__(self, hass: core.HomeAssistant, device: Probe, config: dict, sensor_type_data: list[Any], name: str = None):
         super().__init__()
         self.device = device
         self.config = config
         self.sensor_name = name
         self.sensor_type_data = sensor_type_data
-        self.should_poll = False
 
         self.unit_type = TempUnit(self.config.get("unit_type", TempUnit.CELSIUS))
 
@@ -265,8 +292,9 @@ class CombustionProbeEntity(SensorEntity):
             )
         )
 
-    async def sync(self):
-        self.async_schedule_update_ha_state(True)
+    @callback
+    def sync(self):
+        self.async_write_ha_state()
 
     @property
     def device_info(self):
@@ -287,11 +315,11 @@ class CombustionProbeEntity(SensorEntity):
         return self.sensor_name
 
     @property
-    def available(self) -> str:
+    def available(self) -> bool:
         return not getattr(self.device, "stale", False)
 
     @property
-    def unit_of_measurement(self) -> str:
+    def native_unit_of_measurement(self) -> str | None:
         if self.sensor_type_data[1] == "temp":
             return ("°F" if self.unit_type == TempUnit.FAHRENHEIT else "°C")
         else:
@@ -299,10 +327,22 @@ class CombustionProbeEntity(SensorEntity):
 
     @property
     def device_class(self) -> str | None:
-        return self.sensor_type_data[2]
+        return self.sensor_type_data[2] or None
 
     @property
-    def state(self) -> Optional[str]:
+    def state_class(self) -> SensorStateClass | None:
+        if self.device_class == SensorDeviceClass.ENUM:
+            return None
+        return SensorStateClass.MEASUREMENT
+
+    @property
+    def options(self) -> list[str] | None:
+        if self.device_class == SensorDeviceClass.ENUM:
+            return self.sensor_type_data[4]
+        return None
+
+    @property
+    def native_value(self) -> Any:
 
         state_id = self.sensor_type_data[3]
         if state_id == "t1":
@@ -324,11 +364,11 @@ class CombustionProbeEntity(SensorEntity):
         elif state_id == "instant":
             return convert_temp(self.device._instant_read_celsius, self.unit_type)
         elif state_id == "core":
-            return convert_temp(self.device._virtual_temperatures.value.core_temperature, self.unit_type)
+            return convert_temp(self.device.virtual_temperatures.core_temperature, self.unit_type)
         elif state_id == "ambient":
-            return convert_temp(self.device._virtual_temperatures.value.ambient_temperature, self.unit_type)
+            return convert_temp(self.device.virtual_temperatures.ambient_temperature, self.unit_type)
         elif state_id == "surface":
-            return convert_temp(self.device._virtual_temperatures.value.surface_temperature, self.unit_type)
+            return convert_temp(self.device.virtual_temperatures.surface_temperature, self.unit_type)
         elif state_id == "rssi":
             return self.device.rssi
         elif state_id == "battery":
@@ -357,18 +397,18 @@ class CombustionProbeEntity(SensorEntity):
 class CombustionNodeEntity(SensorEntity):
 
     device: MeatNetNode
-    sensor_type_data: list
-    config: any
+    sensor_type_data: list[Any]
+    config: dict
     sensor_name: str
-
+    _attr_should_poll = False
     unit_type: TempUnit = TempUnit.CELSIUS
 
     def __init__(
         self,
         hass: core.HomeAssistant,
         device: MeatNetNode,
-        config: any,
-        sensor_type_data: list,
+        config: dict,
+        sensor_type_data: list[Any],
         name: str | None = None,
     ):
         super().__init__()
@@ -376,14 +416,14 @@ class CombustionNodeEntity(SensorEntity):
         self.config = config
         self.sensor_name = name
         self.sensor_type_data = sensor_type_data
-        self.should_poll = False
         self.unit_type = TempUnit(self.config.get("unit_type", TempUnit.CELSIUS))
 
     async def async_added_to_hass(self):
         self.async_on_remove(async_dispatcher_connect(self.hass, EVENT_REFRESH, self.sync))
 
-    async def sync(self):
-        self.async_schedule_update_ha_state(True)
+    @callback
+    def sync(self):
+        self.async_write_ha_state()
 
     @property
     def device_info(self):
@@ -402,29 +442,41 @@ class CombustionNodeEntity(SensorEntity):
 
     @property
     def unique_id(self) -> str:
-        return self.sensor_name
+        return f"{DOMAIN}_{self.device.unique_identifier}_{self.sensor_type_data[3]}"
 
     @property
-    def available(self) -> str:
+    def available(self) -> bool:
         return not getattr(self.device, "stale", False)
 
     @property
-    def unit_of_measurement(self) -> str:
+    def native_unit_of_measurement(self) -> str | None:
         if self.sensor_type_data[1] == "temp":
             return ("°F" if self.unit_type == TempUnit.FAHRENHEIT else "°C")
         return self.sensor_type_data[1]
 
     @property
     def device_class(self) -> str | None:
-        return self.sensor_type_data[2]
+        return self.sensor_type_data[2] or None
 
     @property
-    def state(self) -> Optional[str]:
+    def state_class(self) -> SensorStateClass | None:
+        if self.device_class == SensorDeviceClass.ENUM:
+            return None
+        return SensorStateClass.MEASUREMENT
+
+    @property
+    def options(self) -> list[str] | None:
+        if self.device_class == SensorDeviceClass.ENUM:
+            return self.sensor_type_data[4]
+        return None
+
+    @property
+    def native_value(self) -> Any:
         state_id = self.sensor_type_data[3]
         if state_id == "rssi":
             return self.device.rssi
         if state_id == "probes_count":
-            return len(getattr(self.device, "probes", {}) or {})
+            return sum(not probe.stale for probe in self.device.probes.values())
 
         if state_id == "gauge_temp":
             temp_c = getattr(self.device, "gauge_temperature_c", None)
@@ -456,25 +508,11 @@ class CombustionNodeEntity(SensorEntity):
         return None
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        attribs: dict[str, str] = {"last_seen": self.device.last_update_time}
-
-        if self.sensor_type_data[2] != SensorDeviceClass.ENUM:
-            attribs["state_class"] = "measurement"
-        else:
-            attribs["options"] = self.sensor_type_data[4]
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attribs: dict[str, Any] = {"last_seen": self.device.last_update_time.isoformat()}
 
         if getattr(self.device, "gauge_serial", None):
             attribs["gauge_serial"] = self.device.gauge_serial
-
-        # Add best-RSSI metadata for the RSSI sensor
-        if self.sensor_type_data[0] == "RSSI":
-            sorted_rssi = sorted(
-                self.device.device_manager.devices.items(), key=lambda x: x[1].rssi, reverse=True
-            )
-            rssi = sorted_rssi[0][1].rssi
-            attribs["best_rssi"] = rssi
-            attribs["hops"] = getattr(self.device, "_hops", None)
 
         # Add decoded alarm flags for gauge alarm sensors
         if self.sensor_type_data[3] in (
@@ -497,6 +535,3 @@ class CombustionNodeEntity(SensorEntity):
                 attribs["alarm_status_raw"] = alarm_status
 
         return attribs
-
-    async def async_update(self) -> None:
-        return None

@@ -64,7 +64,7 @@ class ConnectionManager:
             del self._node_connect_backoff_until[key]
 
     def received_probe_advertising(self, probe: Optional["Probe"]):
-        if probe is None:
+        if probe is None or not probe.is_connectable:
             return
 
         # Avoid repeated connect storms if the probe (or the host) is currently refusing connects.
@@ -84,7 +84,10 @@ class ConnectionManager:
         elif (
             self.meat_net_enabled
             and probe_status_stale
-            and probe.connection_state != "connected"
+            and probe.connection_state not in (
+                Device.ConnectionState.CONNECTED,
+                Device.ConnectionState.CONNECTING,
+            )
             and probe.serial_number_string not in self.connection_timers
         ):
             self.connection_timers[probe.serial_number_string] = asyncio.create_task(
@@ -98,14 +101,19 @@ class ConnectionManager:
             del self.connection_timers[probe.serial_number_string]
 
     async def connect_probe_after_delay(self, probe: "Probe"):
-        await asyncio.sleep(3)
-        updated_probe = self.get_probe_with_serial(probe.serial_number_string)
-        if updated_probe:
-            await updated_probe.connect()
-        del self.connection_timers[probe.serial_number_string]
+        try:
+            await asyncio.sleep(3)
+            updated_probe = self.get_probe_with_serial(probe.serial_number_string)
+            if updated_probe:
+                await updated_probe.connect()
+        finally:
+            self.connection_timers.pop(probe.serial_number_string, None)
 
     def received_probe_advertising_from_node(self, probe: Optional["Probe"], node: "MeatNetNode"):
-        if self.meat_net_enabled:
+        if self.meat_net_enabled and node.is_connectable and node.connection_state not in (
+            Device.ConnectionState.CONNECTED,
+            Device.ConnectionState.CONNECTING,
+        ):
             node_key = node.ble_identifier or node.unique_identifier
             if self._in_backoff(self._node_connect_backoff_until, node_key):
                 return
@@ -116,7 +124,13 @@ class ConnectionManager:
 
         if not direct_connection and self.meat_net_enabled and not self.dfu_mode_enabled:
             updated_probe = self.get_probe_with_serial(probe.serial_number_string)
-            if updated_probe and updated_probe.connection_state == Device.ConnectionState.CONNECTED:
+            node = self.device_manager._get_best_node_for_probe(probe.serial_number)
+            if (
+                updated_probe
+                and updated_probe.connection_state == Device.ConnectionState.CONNECTED
+                and node is not None
+                and node.rssi > updated_probe.rssi
+            ):
                 ensure_future(updated_probe.disconnect(), "probe.disconnect[prefer_meatnet]")
 
     def get_probe_with_serial(self, serial: str) -> Optional["Probe"]:

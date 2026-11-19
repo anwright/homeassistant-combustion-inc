@@ -120,15 +120,23 @@ class DeviceManager(BleManagerDelegate):
         """Stop all asynchronous tasks and BLE scanning. Must be called prior to terminating your application."""
         if self.timer_task:
             self.timer_task.cancel()
+            await asyncio.gather(self.timer_task, return_exceptions=True)
             self.timer_task = None
 
+        connection_tasks = list(self.connection_manager.connection_timers.values())
+        self.connection_manager.connection_timers.clear()
+        for task in connection_tasks:
+            task.cancel()
+        if connection_tasks:
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
+
         # Attempt to disconnect from all devices.
-        for key in self.devices:
+        for device in list(self.devices.values()):
             try:
-                device = self.devices[key]
-                await device.disconnect()
                 if isinstance(device, Probe):
                     device.stop_session_request_timer()
+                await device.disconnect()
+                if isinstance(device, Probe):
                     self.connection_manager.clear_handlers_for_probe(
                         device, msg="device_manager::async_stop"
                     )
@@ -141,6 +149,12 @@ class DeviceManager(BleManagerDelegate):
             await BleManager.shared.stop_bluetooth()
         except Exception:
             LOGGER.exception("Error stopping BleManager during DeviceManager shutdown.")
+        finally:
+            self.clear_device_listeners()
+            if BleManager.shared.delegate is self:
+                BleManager.shared.delegate = None
+            if DeviceManager.shared is self:
+                DeviceManager.shared = None
 
     async def _start_timers(self):
         while True:
@@ -384,9 +398,7 @@ class DeviceManager(BleManagerDelegate):
             device.firmware_version = version
 
     def update_device_serial_number(self, identifier: str, serial_number: str):
-        if (device := self.find_device_by_ble_identifier(identifier) is not None) and isinstance(
-            device, MeatNetNode
-        ):
+        if isinstance(device := self.find_device_by_ble_identifier(identifier), MeatNetNode):
             device.serial_number_string = serial_number
 
     def update_device_model_info(self, identifier: str, model_info: str):
@@ -415,13 +427,16 @@ class DeviceManager(BleManagerDelegate):
                 advertising, is_connectable, rssi, identifier
             )
             self.connection_manager.received_probe_advertising(probe)
-        elif advertising.type == CombustionProductType.MEAT_NET_NODE:
+        elif advertising.type in (
+            CombustionProductType.MEAT_NET_NODE,
+            CombustionProductType.DISPLAY,
+            CombustionProductType.BOOSTER,
+        ):
             if not self.connection_manager.meat_net_enabled:
                 return
 
             # Update node if it is in device list
             meatnet_node = None
-            new_node = False
             if (meatnet_node := self.devices.get(identifier)) and isinstance(meatnet_node, MeatNetNode):
                 meatnet_node.update_with_advertising(advertising, is_connectable, rssi)
 
@@ -429,7 +444,6 @@ class DeviceManager(BleManagerDelegate):
                 # Create node and add to device list
                 meatnet_node = MeatNetNode(advertising, self, is_connectable, rssi, identifier)
                 self._add_device(meatnet_node)
-                new_node = True
 
             # Update the probe associated with this advertising data
             probe = self.update_probe_with_advertising(
@@ -439,11 +453,9 @@ class DeviceManager(BleManagerDelegate):
                 # Add probe to meatnet node
                 meatnet_node.update_networked_probe(probe)
 
-                if new_node:
-                    # Notify connection manager
-                    self.connection_manager.received_probe_advertising_from_node(
-                        probe, meatnet_node
-                    )
+                self.connection_manager.received_probe_advertising_from_node(
+                    probe, meatnet_node
+                )
 
     def update_device_with_gauge_advertising(
         self, advertising: GaugeAdvertisingData, is_connectable: bool, rssi: int, identifier: str

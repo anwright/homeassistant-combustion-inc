@@ -57,8 +57,8 @@ fi
 # Create symlink for custom_components in HA config
 echo "🔗 Setting up custom_components symlink..."
 mkdir -p config/custom_components
-if [ ! -L "config/custom_components/combustion_custom" ]; then
-    ln -sf "$(pwd)/custom_components/combustion_custom" "config/custom_components/combustion_custom"
+if [ ! -L "config/custom_components/combustion" ]; then
+    ln -sf "$(pwd)/custom_components/combustion" "config/custom_components/combustion"
 fi
 
 echo "✅ Development environment setup complete!"

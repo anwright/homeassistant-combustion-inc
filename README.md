@@ -1,12 +1,14 @@
-# Combustion Inc Intergration for Home Assistant
+# Combustion Inc Integration for Home Assistant
 
-This integration will setup a single [Combustion Inc.](https://combustion.inc) hub with one device for every probe that it detects. Each probe will come with 21 sensors.
+This integration sets up a single [Combustion Inc.](https://combustion.inc) entry. It creates a device for each detected probe or MeatNet node, including Gauges. Each probe has 22 sensors; Gauges have additional temperature and alarm sensors.
 
-The sensors will all move to the unavalaible state if HA doesn't recieve any BLE announcement data within 15s. This will allow you to hide cards by state for when the probe(s) are turned off.
+Sensors become unavailable when no Bluetooth advertisement or status update has been received for 60 seconds. Home Assistant's Bluetooth integration provides the scan data.
 
-The intergration will use the local bluetooth MeatNet as needed. It will prefer the probe directly, unless there is a better signal being broadcast by a MeatNet repeater.
+The integration uses the local Bluetooth MeatNet as needed. It prefers a direct probe connection unless a connected MeatNet repeater offers a stronger signal.
 
 ## Installation
+
+Copy `custom_components/combustion` into your Home Assistant `custom_components` directory, restart Home Assistant, and add **Combustion Inc** under Devices & Services. Bluetooth discovery can also prompt you to add it.
 
 ### Dev Container (VS Code) with Bluetooth (Windows / WSL / Docker Desktop)
 
