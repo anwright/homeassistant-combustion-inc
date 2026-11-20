@@ -182,14 +182,30 @@ def _probe_unique_id(serial_number: str, type_data: list[Any]) -> str:
     return f"Combustion {type_data[0]} {serial_number}"
 
 
+def _entity_object_id(kind: str, identifier: str, label: str) -> str:
+    """Put the device identifier before the sensor's logical name."""
+    kind_id = slugify(kind)
+    identifier_id = slugify(identifier)
+    label_id = slugify(label)
+    label_id = label_id.removeprefix(f"{kind_id}_")
+    if identifier_id:
+        label_id = re.sub(
+            rf"(?<![a-z0-9]){re.escape(identifier_id)}(?![a-z0-9])", "", label_id
+        )
+        label_id = re.sub(r"_+", "_", label_id).strip("_")
+    return "_".join(part for part in (DOMAIN, kind_id, identifier_id, label_id) if part)
+
+
 def _migrate_entity_registry(
     hass: core.HomeAssistant,
     unique_id: str,
     legacy_unique_ids: list[str],
     name: str,
     identifiers: list[str],
+    entity_identifier: str,
+    preferred_object_id: str,
 ) -> None:
-    """Remove device identifiers from registered entity names and entity IDs."""
+    """Clean names and migrate generated IDs to device-first ordering."""
     registry = er.async_get(hass)
     entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
     updates = {}
@@ -213,22 +229,58 @@ def _migrate_entity_registry(
             updates["name"] = cleaned_name if entry.name else name
 
     object_id = entity_id.removeprefix("sensor.")
-    cleaned_id = object_id
-    for identifier in identifiers:
-        token = slugify(identifier) if identifier else ""
-        if token:
-            cleaned_id = re.sub(
-                rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", "", cleaned_id
-            )
-    if cleaned_id != object_id:
-        old_default_id = slugify(entry.original_name) if entry and entry.original_name else ""
-        if old_default_id and re.fullmatch(rf"{re.escape(old_default_id)}(?:_[0-9]+)?", object_id):
-            cleaned_id = slugify(name)
+    identifier_token = slugify(entity_identifier) if entity_identifier else ""
+    identifier_pattern = (
+        rf"(?<![a-z0-9]){re.escape(identifier_token)}(?![a-z0-9])"
+        if identifier_token else None
+    )
+    other_tokens = {
+        token for identifier in identifiers
+        if identifier and (token := slugify(identifier)) and token != identifier_token
+    }
+    other_patterns = [
+        rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])"
+        for token in other_tokens
+    ]
+    has_one_identifier = (
+        bool(identifier_pattern)
+        and len(re.findall(identifier_pattern, object_id)) == 1
+        and not any(re.search(pattern, object_id) for pattern in other_patterns)
+    )
+    old_default_id = slugify(entry.original_name) if entry and entry.original_name else ""
+    old_name_id = slugify(name)
+    auto_prefix = (
+        rf"(?:combustion_)?(?:probe|gauge|meatnet_node)_"
+        rf"(?:{'|'.join(re.escape(token) for token in sorted(other_tokens | {identifier_token}) if token)})_"
+    )
+    generated_ids = [rf"{re.escape(old_name_id)}(?:_{re.escape(identifier_token)})*"]
+    if old_default_id:
+        generated_ids.append(rf"(?:{auto_prefix})?{re.escape(old_default_id)}")
+    generated_match = re.fullmatch(
+        rf"(?:{'|'.join(generated_ids)})(?:_([0-9]+))?", object_id
+    )
+    if generated_match or not has_one_identifier:
+        cleaned_id = object_id
+        for pattern in ([identifier_pattern] if identifier_pattern else []) + other_patterns:
+            cleaned_id = re.sub(pattern, "", cleaned_id)
+        cleaned_id = re.sub(r"_+", "_", cleaned_id).strip("_")
+        if generated_match:
+            base = f"sensor.{preferred_object_id}"
+            collision_suffix = generated_match.group(1)
+            candidate = f"{base}_{collision_suffix}" if collision_suffix else base
+            suffix = int(collision_suffix) + 1 if collision_suffix else 2
         else:
-            cleaned_id = re.sub(r"_+", "_", cleaned_id).strip("_")
-        base = f"sensor.{cleaned_id or slugify(name)}"
-        candidate = base
-        suffix = 2
+            logical_suffix = preferred_object_id.partition(f"_{identifier_token}_")[2]
+            if logical_suffix and cleaned_id.endswith(f"_{logical_suffix}"):
+                prefix = cleaned_id[: -len(logical_suffix)]
+                custom_id = f"{prefix}{identifier_token}_{logical_suffix}"
+            elif cleaned_id == logical_suffix:
+                custom_id = f"{identifier_token}_{logical_suffix}"
+            else:
+                custom_id = "_".join(part for part in (cleaned_id, identifier_token) if part)
+            base = f"sensor.{custom_id or slugify(name)}"
+            candidate = base
+            suffix = 2
         while candidate != entity_id and (
             registry.async_get(candidate) is not None or hass.states.get(candidate) is not None
         ):
@@ -244,7 +296,7 @@ def _migrate_entity_registry(
 def _migrate_node_entity_registry(
     hass: core.HomeAssistant, device: MeatNetNode, type_data: list[Any], name: str
 ) -> None:
-    """Migrate legacy node and Gauge entities to serial-free entity IDs."""
+    """Migrate node and Gauge names and keep one ID identifier."""
     legacy_names = []
     identifiers = []
     if device.ble_identifier:
@@ -260,6 +312,12 @@ def _migrate_node_entity_registry(
         legacy_names,
         name,
         identifiers,
+        device.gauge_serial or (device.ble_identifier[-5:] if device.ble_identifier else ""),
+        _entity_object_id(
+            "MeatNet Node" if type_data[3] in ("rssi", "probes_count") else "Gauge",
+            device.gauge_serial or (device.ble_identifier[-5:] if device.ble_identifier else ""),
+            type_data[0],
+        ),
     )
 
 
@@ -284,6 +342,8 @@ def _migrate_offline_entities(
                     [],
                     f"Combustion {type_data[0]}",
                     [serial_number],
+                    serial_number,
+                    _entity_object_id("Probe", serial_number, type_data[0]),
                 )
                 migrated = True
             break
@@ -291,6 +351,9 @@ def _migrate_offline_entities(
             continue
 
         for sensor_type, type_data in NODE_SENSOR_TYPES.items():
+            preferred_kind = (
+                "MeatNet Node" if sensor_type in ("node_rssi", "node_probes") else "Gauge"
+            )
             name = (
                 f"Combustion MeatNet Node {type_data[0]}"
                 if sensor_type in ("node_rssi", "node_probes")
@@ -308,6 +371,10 @@ def _migrate_offline_entities(
                             [],
                             name,
                             [source[len(prefix):]],
+                            source[len(prefix):],
+                            _entity_object_id(
+                                preferred_kind, source[len(prefix):], type_data[0]
+                            ),
                         )
                         migrated = True
                         break
@@ -346,6 +413,8 @@ async def async_setup_entry(
                     [],
                     name,
                     [device.serial_number_string],
+                    device.serial_number_string,
+                    _entity_object_id("Probe", device.serial_number_string, type_data[0]),
                 )
                 sensors.append(CombustionProbeEntity(hass, device, config, type_data, name))
 
@@ -409,6 +478,9 @@ class CombustionProbeEntity(SensorEntity):
         self.config = config
         self.sensor_name = name
         self.sensor_type_data = sensor_type_data
+        self._attr_suggested_object_id = _entity_object_id(
+            "Probe", device.serial_number_string, sensor_type_data[0]
+        )
 
         self.unit_type = TempUnit(self.config.get("unit_type", TempUnit.CELSIUS))
 
@@ -546,6 +618,11 @@ class CombustionNodeEntity(SensorEntity):
         self.config = config
         self.sensor_name = name
         self.sensor_type_data = sensor_type_data
+        identifier = device.gauge_serial or (
+            device.ble_identifier[-5:] if device.ble_identifier else ""
+        )
+        kind = "MeatNet Node" if sensor_type_data[3] in ("rssi", "probes_count") else "Gauge"
+        self._attr_suggested_object_id = _entity_object_id(kind, identifier, sensor_type_data[0])
         self.unit_type = TempUnit(self.config.get("unit_type", TempUnit.CELSIUS))
 
     async def async_added_to_hass(self):
