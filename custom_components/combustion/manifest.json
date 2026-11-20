@@ -9,7 +9,8 @@
   "single_config_entry": true,
   "bluetooth": [
     {
-      "manufacturer_id": 2503
+      "manufacturer_id": 2503,
+      "connectable": false
     }
   ],
   "integration_type": "hub",

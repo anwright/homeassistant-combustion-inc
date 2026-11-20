@@ -41,7 +41,7 @@ class MeatNetManager:
             self._unsubscribe = bluetooth.async_register_callback(
                 self.hass,
                 self._advertisement,
-                {"manufacturer_id": BT_MANUFACTURER_ID},
+                {"manufacturer_id": BT_MANUFACTURER_ID, "connectable": False},
                 bluetooth.BluetoothScanningMode.ACTIVE,
             )
         except Exception:
