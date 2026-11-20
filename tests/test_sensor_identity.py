@@ -18,24 +18,62 @@ from custom_components.combustion.sensor import (
 
 
 @pytest.mark.parametrize(
-    "old_entity_id",
+    ("sensor_type", "serial", "old_entity_id", "expected_entity_id", "original_name"),
     [
-        "sensor.combustion_probe_t1",
-        "sensor.combustion_probe_t1_deadbeef",
-        "sensor.probe_deadbeef_combustion_probe_t1_deadbeef",
-        "sensor.combustion_probe_t1_deadbeef_deadbeef",
-        "sensor.combustion_probe_deadbeef_t1",
+        (
+            "prob_temp_t1", "DEADBEEF",
+            "sensor.probe_deadbeef_combustion_probe_t1_deadbeef",
+            "sensor.combustion_probe_deadbeef_t1",
+            None,
+        ),
+        (
+            "prob_temp_core", "10010790",
+            "sensor.probe_10010790_combustion_core_temperature_10010790",
+            "sensor.combustion_probe_10010790_core_temperature",
+            None,
+        ),
+        (
+            "prob_temp_core", "10010790",
+            "sensor.probe_10010790_combustion_core_temperature_10010790",
+            "sensor.combustion_probe_10010790_core_temperature",
+            "Combustion Core Temperature",
+        ),
+        (
+            "prob_temp_ambient", "10010790",
+            "sensor.probe_10010790_combustion_ambient_temperature_10010790",
+            "sensor.combustion_probe_10010790_ambient_temperature",
+            None,
+        ),
+        (
+            "prob_temp_surface", "10010790",
+            "sensor.probe_10010790_combustion_surface_temperature_10010790",
+            "sensor.combustion_probe_10010790_surface_temperature",
+            None,
+        ),
+        (
+            "prob_temp_t8", "10010790",
+            "sensor.probe_10010790_combustion_probe_t8_10010790",
+            "sensor.combustion_probe_10010790_t8",
+            None,
+        ),
+        (
+            "prob_temp_core", "10010790",
+            "sensor.probe_10010790_combustion_core_temperature_10010790_2",
+            "sensor.combustion_probe_10010790_core_temperature_2",
+            "Combustion Core Temperature",
+        ),
     ],
 )
-def test_probe_registry_entry_has_one_serial_in_id_and_none_in_name(old_entity_id):
-    serial = "DEADBEEF"
-    type_data = SENSOR_TYPES["prob_temp_t1"]
+def test_probe_registry_entry_has_one_serial_in_id_and_none_in_name(
+    sensor_type, serial, old_entity_id, expected_entity_id, original_name
+):
+    type_data = SENSOR_TYPES[sensor_type]
     old_unique_id = f"Combustion {type_data[0]} {serial}"
     entry = SimpleNamespace(
         entity_id=old_entity_id,
         unique_id=old_unique_id,
         name=None,
-        original_name=old_unique_id,
+        original_name=original_name or old_unique_id,
         domain="sensor",
         platform="combustion",
     )
@@ -63,8 +101,49 @@ def test_probe_registry_entry_has_one_serial_in_id_and_none_in_name(old_entity_i
         _migrate_offline_entities(hass, SimpleNamespace(entry_id="test"))
 
     assert entry.unique_id == _probe_unique_id(serial, type_data) == old_unique_id
-    assert entry.entity_id == "sensor.combustion_probe_deadbeef_t1"
-    assert entry.name == "Combustion Probe T1"
+    assert entry.entity_id == expected_entity_id
+    assert (entry.name or entry.original_name) == f"Combustion {type_data[0]}"
+
+
+def test_intermediate_probe_id_is_left_for_manual_cleanup():
+    serial = "10010790"
+    type_data = SENSOR_TYPES["prob_temp_core"]
+    entity_id = "sensor.probe_combustion_core_temperature_2_10010790"
+    entry = SimpleNamespace(
+        entity_id=entity_id,
+        unique_id=_probe_unique_id(serial, type_data),
+        name=None,
+        original_name=f"Combustion Core Temperature {serial}",
+    )
+
+    class Registry:
+        def async_get_entity_id(self, domain, platform, unique_id):
+            if (domain, platform, unique_id) == ("sensor", "combustion", entry.unique_id):
+                return entity_id
+            return None
+
+        def async_get(self, candidate):
+            return entry if candidate == entity_id else None
+
+        def async_update_entity(self, existing_id, **changes):
+            assert existing_id == entity_id
+            assert "new_entity_id" not in changes
+            entry.name = changes.get("name", entry.name)
+
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda candidate: None))
+    with patch("custom_components.combustion.sensor.er.async_get", return_value=Registry()):
+        _migrate_entity_registry(
+            hass,
+            entry.unique_id,
+            [],
+            "Combustion Core Temperature",
+            [serial],
+            serial,
+            "combustion_probe_10010790_core_temperature",
+        )
+
+    assert entry.entity_id == entity_id
+    assert entry.name == "Combustion Core Temperature"
 
 
 @pytest.mark.parametrize(

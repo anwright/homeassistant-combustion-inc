@@ -259,14 +259,27 @@ def _migrate_entity_registry(
     generated_match = re.fullmatch(
         rf"(?:{'|'.join(generated_ids)})(?:_([0-9]+))?", object_id
     )
-    if generated_match or not has_one_identifier:
+    # The first probe IDs included the serial in both the device prefix and
+    # entity name. Match that shape independently of entry.original_name,
+    # which Home Assistant may have refreshed since the ID was created.
+    original_probe_match = (
+        re.fullmatch(
+            rf"probe_{re.escape(identifier_token)}_"
+            rf"{re.escape(old_name_id)}_{re.escape(identifier_token)}"
+            r"(?:_([0-9]+))?",
+            object_id,
+        )
+        if preferred_object_id.startswith(f"{DOMAIN}_probe_{identifier_token}_")
+        else None
+    )
+    if original_probe_match or generated_match or not has_one_identifier:
         cleaned_id = object_id
         for pattern in ([identifier_pattern] if identifier_pattern else []) + other_patterns:
             cleaned_id = re.sub(pattern, "", cleaned_id)
         cleaned_id = re.sub(r"_+", "_", cleaned_id).strip("_")
-        if generated_match:
+        if original_probe_match or generated_match:
             base = f"sensor.{preferred_object_id}"
-            collision_suffix = generated_match.group(1)
+            collision_suffix = (original_probe_match or generated_match).group(1)
             candidate = f"{base}_{collision_suffix}" if collision_suffix else base
             suffix = int(collision_suffix) + 1 if collision_suffix else 2
         else:
